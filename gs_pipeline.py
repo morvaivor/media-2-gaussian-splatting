@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-Pipeline 3D Gaussian Splatting depuis vidéo/photo Insta360 X4.
+Pipeline 3D Gaussian Splatting depuis vidéo/photo (Insta360 X4 360° ou perspective 1080p).
 
 Étapes :
   1. preprocess  - Extraction frames + déstériscoping 360° → 8 vues perspective
-  2. mask        - Masquage cameraman (YOLOv8 / SAM2)
-  3. reconstruct - Reconstruction COLMAP
+                   (détection auto 360°/perspective par ratio, ou --format)
+  2. mask        - Masquage cameraman (YOLOv8)
+  3. reconstruct - Reconstruction COLMAP (SIFT boosté, --max-features)
   4. train       - Training 3DGS avec Brush
   5. run-all     - Toutes les étapes séquentielles
+  6. clean       - Suppression des fichiers intermédiaires (conserve output/)
 """
 
 import argparse
@@ -26,9 +28,31 @@ import numpy as np
 VIDEO_EXTS = {".mp4", ".insv", ".mov", ".avi", ".mkv"}
 PHOTO_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
 
+INTERMEDIATE_DIRS = ["frames", "frames_masked", "masks", "colmap"]
+
+
+def get_data_dir(args) -> Path:
+    return Path(args.work_dir) / args.data_dir
+
 
 class PipelineError(Exception):
     pass
+
+
+class TimeoutError(Exception):
+    """Exception personnalisée pour les timeouts."""
+    pass
+
+
+def run_command_with_timeout(cmd: list, timeout: int = 300, **kwargs) -> subprocess.CompletedProcess:
+    """Exécute une commande avec gestion de timeout et vérification du retour."""
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, **kwargs)
+        return result
+    except subprocess.TimeoutExpired:
+        raise TimeoutError(f"Commande '{' '.join(cmd)}' a dépassé le temps limit de {timeout}s")
+    except Exception as e:
+        raise TimeoutError(f"Erreur lors de l'exécution de '{' '.join(cmd)}' : {e}")
 
 
 class PipelineLog:
@@ -136,7 +160,7 @@ def find_input_files(input_path: Path):
         elif ext in PHOTO_EXTS:
             photos.append(input_path)
         else:
-            raise PipelineError(f"Format non reconnu : {ext}. Formats acceptés : {VIDEO_EXTS | PHOTO_EXTS}")
+            raise PipelineError(f"Format non reconnu : {ext}. Formats acceptés : {VIDEO_EXTS.union(PHOTO_EXTS)}")
     elif input_path.is_dir():
         for f in sorted(input_path.iterdir()):
             if f.is_file():
@@ -156,13 +180,14 @@ def find_input_files(input_path: Path):
 
 
 
-
 def extract_video_frames(video_path: Path, output_dir: Path, fps: int = 2) -> list:
     """Extrait des frames d'une vidéo à la fréquence donnée.
     Pour les .insv, essaie d'abord Insta360 Studio, puis ffmpeg.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
-    pattern = str(output_dir / "frame_%05d.jpg")
+    raw_dir = output_dir / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    pattern = str(raw_dir / "frame_%05d.jpg")
 
     # Pour les .insv, essayer Insta360 Studio d'abord
     if video_path.suffix.lower() == ".insv":
@@ -175,15 +200,15 @@ def extract_video_frames(video_path: Path, output_dir: Path, fps: int = 2) -> li
         for p in insta360_paths:
             if os.path.exists(p):
                 try:
-                    cmd = [p, "--convert", str(video_path), "--output", str(output_dir), "--format", "equirectangular"]
-                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+                    cmd = [p, "--convert", str(video_path), "--output", str(raw_dir), "--format", "equirectangular"]
+                    result = run_command_with_timeout(cmd, timeout=300)
                     if result.returncode == 0:
-                        frames = sorted(output_dir.glob("*.jpg")) + sorted(output_dir.glob("*.png"))
+                        frames = sorted(raw_dir.glob("*.jpg")) + sorted(raw_dir.glob("*.png"))
                         if frames:
                             print(f"    {len(frames)} frames extraites via Insta360 Studio")
                             return frames
-                except (subprocess.TimeoutExpired, OSError):
-                    pass
+                except TimeoutError:
+                    print(f"    Timeout lors de l'extraction Insta360 Studio, passage à ffmpeg")
         print("    Insta360 Studio non trouvé, utilisation de ffmpeg pour .insv...")
 
     cmd = [
@@ -193,15 +218,64 @@ def extract_video_frames(video_path: Path, output_dir: Path, fps: int = 2) -> li
         pattern,
     ]
     print(f"  Extraction des frames de {video_path.name} à {fps} FPS...")
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = run_command_with_timeout(cmd, timeout=300)
     if result.returncode != 0:
         raise PipelineError(f"ffmpeg a échoué lors de l'extraction des frames : {result.stderr[:500]}")
 
-    frames = sorted(output_dir.glob("frame_*.jpg"))
+    frames = sorted(raw_dir.glob("frame_*.jpg"))
     if not frames:
         raise PipelineError(f"Aucune frame extraite de {video_path.name}")
     print(f"    {len(frames)} frames extraites")
     return frames
+
+
+def is_equirectangular(shape) -> bool:
+    """Une image est considérée 360° equirect si son ratio w/h est ~2:1."""
+    h, w = shape[:2]
+    if h == 0:
+        return False
+    ratio = w / h
+    return 1.9 <= ratio <= 2.1
+
+
+def save_as_perspective(input_path: Path, output_dir: Path, width: int = 1920, height: int = 1080) -> list:
+    """Redimensionne une image perspective (non 360°) et la sauvegarde en view_00.jpg."""
+    import cv2
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    img = cv2.imread(str(input_path))
+    if img is None:
+        raise PipelineError(f"Impossible de lire l'image : {input_path}")
+
+    if (img.shape[1], img.shape[0]) != (width, height):
+        img = cv2.resize(img, (width, height), interpolation=cv2.INTER_AREA)
+
+    out_path = output_dir / "view_00.jpg"
+    cv2.imwrite(str(out_path), img)
+    return [out_path]
+
+
+def process_single_image(img_path: Path, view_dir: Path, args) -> list:
+    """Route une image vers le bon traitement selon son format (360° ou perspective)."""
+    import cv2
+
+    img = cv2.imread(str(img_path))
+    if img is None:
+        raise PipelineError(f"Impossible de lire l'image : {img_path}")
+
+    kind = args.format
+    if kind == "auto":
+        kind = "360" if is_equirectangular(img.shape) else "perspective"
+
+    if kind == "360":
+        return destripe_360_to_perspective(
+            img_path, view_dir,
+            num_views=args.num_views,
+            fov=args.fov,
+            width=args.width,
+            height=args.height,
+        )
+    return save_as_perspective(img_path, view_dir, width=args.width, height=args.height)
 
 
 def destripe_360_to_perspective(input_path: Path, output_dir: Path, num_views: int = 8, fov: float = 90.0, width: int = 1920, height: int = 1080) -> list:
@@ -265,11 +339,13 @@ def destripe_360_to_perspective(input_path: Path, output_dir: Path, num_views: i
             v_eq_rot.astype(np.float32),
             cv2.INTER_LINEAR,
         )
-        out_path = output_dir / f"view_{i:02d}.jpg"
+        out_path = output_dir / f"view_{output_dir.name}_{i:02d}.jpg"
         cv2.imwrite(str(out_path), perspective_img)
         output_paths.append(out_path)
 
     return output_paths
+
+
 
 
 def preprocess(args):
@@ -280,7 +356,8 @@ def preprocess(args):
     check_opencv()
 
     work_dir = Path(args.work_dir)
-    frames_dir = work_dir / "frames"
+    data_dir = get_data_dir(args)
+    frames_dir = data_dir / "frames"
     frames_dir.mkdir(parents=True, exist_ok=True)
 
     videos, photos = find_input_files(Path(args.input))
@@ -290,30 +367,23 @@ def preprocess(args):
     for video in videos:
         video_frames_dir = frames_dir / f"video_{video.stem}"
         frames = extract_video_frames(video, video_frames_dir, fps=args.fps)
+        total_views = 0
         for frame in frames:
             view_dir = frames_dir / f"video_{video.stem}" / f"{frame.stem}"
-            views = destripe_360_to_perspective(
-                frame, view_dir,
-                num_views=args.num_views,
-                fov=args.fov,
-                width=args.width,
-                height=args.height,
-            )
+            views = process_single_image(frame, view_dir, args)
+            total_views += len(views)
             total_images += len(views)
-        print(f"    Vidéo {video.name} : {len(frames)} frames → {len(frames) * args.num_views} vues")
+        views_per_frame = total_views / len(frames) if frames else 0
+        fmt = "auto" if args.format == "auto" else args.format
+        print(f"    Vidéo {video.name} ({fmt}) : {len(frames)} frames → {total_views} vues ({views_per_frame:.1f}/frame)")
 
-    # Traitement des photos 360° equirectangular
+    # Traitement des photos
     for photo in photos:
         view_dir = frames_dir / f"{photo.stem}"
-        views = destripe_360_to_perspective(
-            photo, view_dir,
-            num_views=args.num_views,
-            fov=args.fov,
-            width=args.width,
-            height=args.height,
-        )
+        views = process_single_image(photo, view_dir, args)
         total_images += len(views)
-        print(f"    Photo {photo.name} : {len(views)} vues")
+        fmt = "auto" if args.format == "auto" else args.format
+        print(f"    Photo {photo.name} ({fmt}) : {len(views)} vues")
 
     duration = time.time() - start
     return {
@@ -332,19 +402,20 @@ def mask_cameraman(args):
     import cv2
 
     work_dir = Path(args.work_dir)
-    frames_dir = work_dir / "frames"
-    masked_dir = work_dir / "frames_masked"
-    masks_dir = work_dir / "masks"
+    data_dir = get_data_dir(args)
+    frames_dir = data_dir / "frames"
+    masked_dir = data_dir / "frames_masked"
+    masks_dir = data_dir / "masks"
     masked_dir.mkdir(parents=True, exist_ok=True)
     masks_dir.mkdir(parents=True, exist_ok=True)
 
     if not frames_dir.exists():
         raise PipelineError(f"Dossier frames/ introuvable : {frames_dir}. Lancez d'abord l'étape preprocess.")
 
-    # Collecte de toutes les images
-    all_images = sorted(frames_dir.rglob("*.jpg")) + sorted(frames_dir.rglob("*.png"))
+    # Collecte des vues perspective uniquement (pas les frames equirect brutes)
+    all_images = sorted(frames_dir.rglob("view_*.jpg"))
     if not all_images:
-        raise PipelineError(f"Aucune image trouvée dans {frames_dir}")
+        raise PipelineError(f"Aucune vue perspective (view_*.jpg) trouvée dans {frames_dir}")
 
     # Masque manuel
     if args.mask_path:
@@ -381,7 +452,7 @@ def mask_cameraman(args):
                 for i in range(len(r.boxes)):
                     cls_id = int(r.boxes.cls[i].item())
                     if cls_id == 0:  # person class
-                        x1, y1, x2, y2 = [int(v) for v in r.boxes.xyxy[i].tolist()]
+                        x1, y1, x2, y2 = [int(v) for v in r.boxes.xyxy[i].numpy().tolist()]
                         x1, y1 = max(0, x1), max(0, y1)
                         x2, y2 = min(w, x2), min(h, y2)
                         if x2 > x1 and y2 > y1:
@@ -409,14 +480,17 @@ def mask_cameraman(args):
     return {"images_masked": count, "duration": duration}
 
 
+
+
 def reconstruct(args):
     """Étape 3 : Reconstruction COLMAP."""
     print("\n=== ÉTAPE 3 : RECONSTRUCTION COLMAP ===")
     start = time.time()
 
     work_dir = Path(args.work_dir)
-    masked_dir = work_dir / "frames_masked"
-    colmap_dir = work_dir / "colmap"
+    data_dir = get_data_dir(args)
+    masked_dir = data_dir / "frames_masked"
+    colmap_dir = data_dir / "colmap"
     colmap_dir.mkdir(parents=True, exist_ok=True)
 
     if not masked_dir.exists():
@@ -457,14 +531,17 @@ def reconstruct(args):
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(str(img), str(dest))
 
-    # Feature extraction (auto camera model)
-    print("  Feature extraction...")
+    # Feature extraction (auto camera model, SIFT boosté)
+    print(f"  Feature extraction (max_features={args.max_features})...")
     cmd_extract = [
         colmap_bin, "feature_extractor",
         "--database_path", str(colmap_dir / "database.db"),
         "--image_path", str(colmap_images),
+        "--Sift.MaxNumFeatures", str(args.max_features),
+        "--Sift.PeakThreshold", str(args.peak_threshold),
+        "--SiftEdgeThreshold", "10",
     ]
-    result = subprocess.run(cmd_extract, capture_output=True, text=True)
+    result = run_command_with_timeout(cmd_extract, timeout=3600)
     if result.returncode != 0:
         raise PipelineError(f"COLMAP feature_extractor a échoué : {result.stderr[:500]}")
 
@@ -473,9 +550,8 @@ def reconstruct(args):
     cmd_match = [
         colmap_bin, "sequential_matcher",
         "--database_path", str(colmap_dir / "database.db"),
-        "--loop_detection", "0",
     ]
-    result = subprocess.run(cmd_match, capture_output=True, text=True)
+    result = run_command_with_timeout(cmd_match, timeout=3600)
     if result.returncode != 0:
         raise PipelineError(f"COLMAP sequential_matcher a échoué : {result.stderr[:500]}")
 
@@ -487,7 +563,7 @@ def reconstruct(args):
         "--image_path", str(colmap_images),
         "--output_path", str(colmap_dir / "sparse"),
     ]
-    result = subprocess.run(cmd_recon, capture_output=True, text=True)
+    result = run_command_with_timeout(cmd_recon, timeout=7200)
     if result.returncode != 0:
         raise PipelineError(f"COLMAP mapper a échoué : {result.stderr[:500]}")
 
@@ -497,8 +573,10 @@ def reconstruct(args):
         if not (colmap_sparse / f).exists():
             raise PipelineError(f"Fichier COLMAP manquant : {colmap_sparse / f}")
 
-    duration = time.time() - start
-    return {"duration": duration}
+    # Retour structuré
+    return {"duration": time.time() - start, "colmap_dir": str(colmap_dir)}
+
+
 
 
 def train(args):
@@ -507,15 +585,16 @@ def train(args):
     start = time.time()
 
     work_dir = Path(args.work_dir)
-    colmap_dir = work_dir / "colmap"
-    masks_dir = work_dir / "masks"
+    data_dir = get_data_dir(args)
+    colmap_dir = data_dir / "colmap"
+    masks_dir = data_dir / "masks"
     output_dir = work_dir / "output"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if not colmap_dir.exists():
         raise PipelineError(f"Dossier colmap/ introuvable : {colmap_dir}. Lancez d'abord l'étape reconstruct.")
 
-    # Trouver le binaire Brush
+    # Trouver le binaire Brush (CLI)
     brush_bin = None
     if args.brush_path:
         brush_bin = args.brush_path
@@ -533,6 +612,22 @@ def train(args):
                     brush_bin = c
                     break
         if brush_bin is None:
+            # Fallback : chercher brush_app.exe et extraire le sous-binaire CLI
+            brush_app_path = shutil.which("brush_app.exe")
+            if brush_app_path and os.path.exists(brush_app_path):
+                brush_bin = brush_app_path
+            else:
+                candidates_app = [
+                    r"C:\Program Files\Brush\brush_app.exe",
+                    r"C:\Brush\brush_app.exe",
+                    "/usr/local/bin/brush_app",
+                    "/usr/bin/brush_app",
+                ]
+                for c in candidates_app:
+                    if os.path.exists(c):
+                        brush_bin = c
+                        break
+        if brush_bin is None:
             raise PipelineError("Brush introuvable. Installez Brush ou utilisez --brush-path.")
 
     # Structure COLMAP pour Brush
@@ -546,34 +641,86 @@ def train(args):
             shutil.copytree(str(masks_dir), str(colmap_masks))
 
     # Lancer Brush
-    print(f"  Lancement de Brush (iterations={args.iterations})...")
+    print(f"  Lancement de Brush (total-steps={args.iterations})...")
     cmd = [
-        brush_bin, "train",
-        "--data", str(colmap_dir),
-        "--iterations", str(args.iterations),
+        brush_bin, str(colmap_dir),
+        "--total-steps", str(args.iterations),
+        "--export-path", str(output_dir),
+        "--export-name", "model.ply",
+        "--export-every", str(args.iterations),
     ]
     if args.resolution:
-        cmd.extend(["--resolution", str(args.resolution)])
+        cmd.extend(["--max-resolution", str(args.resolution)])
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = run_command_with_timeout(cmd, timeout=10800)
     if result.returncode != 0:
         raise PipelineError(f"Brush a échoué : {result.stderr[:500]}")
 
-    # Brush écrit le .ply dans le dossier de données
+    # Brush exporte le .ply via --export-path
     # Chercher le fichier .ply généré
     model_ply = None
-    for ply in colmap_dir.rglob("*.ply"):
-        model_ply = ply
-        break
+    for search_dir in [output_dir, colmap_dir]:
+        for ply in search_dir.rglob("*.ply"):
+            if "init" in ply.name:
+                continue
+            model_ply = ply
+            break
+        if model_ply:
+            break
     if model_ply is None:
-        raise PipelineError(f"Fichier .ply non généré dans {colmap_dir}")
+        raise PipelineError(f"Fichier .ply non généré dans {output_dir} ou {colmap_dir}")
 
-    # Copier le .ply dans le dossier output
-    shutil.copy2(str(model_ply), str(output_dir / "model.ply"))
-    model_ply = output_dir / "model.ply"
+    # Copier le .ply dans le dossier output si il n'y est pas déjà
+    dest = output_dir / "model.ply"
+    if model_ply.resolve() != dest.resolve():
+        shutil.copy2(str(model_ply), str(dest))
+    model_ply = dest
 
-    duration = time.time() - start
-    return {"model_ply": str(model_ply), "duration": duration}
+    return {"model_ply": str(model_ply), "duration": time.time() - start}
+
+
+
+
+def clean(args):
+    """Supprime les fichiers intermédiaires (frames, masks, COLMAP), conserve output/."""
+    print("\n=== NETTOYAGE ===")
+    start = time.time()
+
+    work_dir = Path(args.work_dir)
+    data_dir = get_data_dir(args)
+    removed = []
+
+    def remove_dir(d: Path):
+        if d.exists():
+            size = sum(f.stat().st_size for f in d.rglob("*") if f.is_file())
+            shutil.rmtree(d)
+            removed.append(d.name)
+            print(f"  Supprimé {d} ({size / 1024 / 1024:.1f} Mo)")
+
+    for name in INTERMEDIATE_DIRS:
+        remove_dir(data_dir / name)
+
+    # Nettoyer aussi les dossiers intermédiaires laissés en racine par d'anciennes versions
+    for name in INTERMEDIATE_DIRS:
+        remove_dir(work_dir / name)
+
+    # Supprimer le data_dir s'il est devenu vide
+    if data_dir.exists() and not any(data_dir.iterdir()):
+        data_dir.rmdir()
+        removed.append("data_dir")
+
+    # Supprimer aussi le log si demandé
+    if getattr(args, "clean_log", False):
+        log_path = work_dir / "pipeline_log.json"
+        if log_path.exists():
+            log_path.unlink()
+            removed.append("pipeline_log.json")
+
+    if not removed:
+        print("  Rien à supprimer.")
+
+    print(f"  Conserver : output/ (modèle final)")
+    return {"removed": removed, "duration": time.time() - start}
 
 
 def run_all(args):
@@ -589,6 +736,9 @@ def run_all(args):
         "mask_path": args.mask_path,
         "iterations": args.iterations,
         "resolution": args.resolution,
+        "max_features": args.max_features,
+        "peak_threshold": args.peak_threshold,
+        "data_dir": args.data_dir,
     }
 
     steps = [
@@ -612,16 +762,23 @@ def run_all(args):
             log.finish()
             print(f"\nPipeline arrêté à l'étape '{step_name}' : {e}")
             sys.exit(1)
+        except TimeoutError as e:
+            log.add_error(step_name, f"Timeout après {e.args[0]}")
+            log.finish()
+            print(f"\nPipeline arrêté à l'étape '{step_name}' : Timeout après {e.args[0]}")
+            sys.exit(1)
         except Exception as e:
             log.add_error(step_name, f"Erreur inattendue : {e}")
             log.finish()
-            print(f"\nPipeline arrêté à l'étape '{step_name}' : {e}")
+            print(f"\nPipeline arrêté à l'étape '{step_name}' : Erreur inattendue : {e}")
             sys.exit(1)
 
     log.finish()
     print(f"\n=== PIPELINE TERMINÉ ===")
     if log.output_ply:
         print(f"Modèle 3DGS : {log.output_ply}")
+
+
 
 
 def main():
@@ -636,14 +793,18 @@ Exemples :
   %(prog)s mask
   %(prog)s reconstruct
   %(prog)s train --iterations 30000
+  %(prog)s clean
+  %(prog)s clean --clean-log
         """,
     )
-    parser.add_argument("command", choices=["preprocess", "mask", "reconstruct", "train", "run-all"],
+    parser.add_argument("command", choices=["preprocess", "mask", "reconstruct", "train", "run-all", "clean"],
                         help="Étape à exécuter")
     parser.add_argument("--input", "-i", default=None,
                         help="Chemin d'entrée (vidéo, photo, ou dossier)")
     parser.add_argument("--work-dir", "-w", default=".",
                         help="Dossier de travail (défaut : .)")
+    parser.add_argument("--data-dir", default="gs_work",
+                        help="Sous-dossier pour les fichiers intermédiaires (défaut : gs_work, vide = directement dans work-dir)")
     parser.add_argument("--fps", type=int, default=2,
                         help="Fréquence d'extraction des frames (défaut : 2)")
     parser.add_argument("--num-views", type=int, default=8,
@@ -654,6 +815,8 @@ Exemples :
                         help="Largeur de sortie (défaut : 1920)")
     parser.add_argument("--height", type=int, default=1080,
                         help="Hauteur de sortie (défaut : 1080)")
+    parser.add_argument("--format", default="auto", choices=["auto", "360", "perspective"],
+                        help="Format de l'input : auto (détection par ratio 2:1), 360 (equirectangular forcé), perspective (non-360 forcé)")
     parser.add_argument("--mask-path", default=None,
                         help="Chemin vers un masque manuel (image noir/blanc)")
     parser.add_argument("--colmap-path", default=None,
@@ -663,7 +826,13 @@ Exemples :
     parser.add_argument("--iterations", type=int, default=30000,
                         help="Nombre d'itérations de training (défaut : 30000)")
     parser.add_argument("--resolution", type=int, default=None,
-                        help="Résolution de training (optionnel)")
+                        help="Résolution max de training (optionnel)")
+    parser.add_argument("--max-features", type=int, default=40960,
+                        help="Max de features SIFT par image (défaut : 40960, standard : 8192)")
+    parser.add_argument("--peak-threshold", type=float, default=1e-4,
+                        help="Seuil de pic SIFT, plus bas = plus de features (défaut : 0.0001)")
+    parser.add_argument("--clean-log", action="store_true",
+                        help="Pour la commande clean : supprimer aussi pipeline_log.json")
 
     args = parser.parse_args()
 
@@ -686,9 +855,15 @@ Exemples :
             print(f"\nTraining terminé : {result['model_ply']}")
         elif args.command == "run-all":
             run_all(args)
+        elif args.command == "clean":
+            result = clean(args)
+            print(f"\nNettoyage terminé : {', '.join(result['removed']) or 'rien à supprimer'}")
     except PipelineError as e:
         print(f"\nERREUR : {e}", file=sys.stderr)
         sys.exit(1)
+    except TimeoutError as e:
+        print(f"\nTIMEOUT : {e}", file=sys.stderr)
+        sys.exit(130)
     except KeyboardInterrupt:
         print("\nInterrompu par l'utilisateur.", file=sys.stderr)
         sys.exit(130)

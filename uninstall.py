@@ -20,7 +20,7 @@ IS_LINUX = platform.system() == "Linux"
 INSTALL_DIR = Path(__file__).parent / "gs_env"
 BIN_DIR = INSTALL_DIR / "bin"
 VENV_DIR = INSTALL_DIR / "venv"
-DATA_DIRS = ["frames", "frames_masked", "masks", "colmap", "output"]
+DATA_DIRS = ["gs_work", "frames", "frames_masked", "masks", "colmap", "output"]
 
 
 def log(msg: str):

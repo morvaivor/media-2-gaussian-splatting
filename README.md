@@ -6,11 +6,14 @@ Pipeline automatisé pour créer un modèle 3D Gaussian Splatting à partir de v
 
 - **Prétraitement** : extraction de frames vidéo (2 FPS par défaut) + déstériscoping 360° equirectangular → 8 vues perspective (FOV 90°)
 - **Support multi-format** : vidéos (.mp4, .insv, .mov, .avi, .mkv) et photos (.jpg, .png, .tif)
+- **360° et perspective** : détection automatique (ratio 2:1 = 360°) ou forcée via `--format`
 - **Masquage cameraman** : détection automatique avec YOLOv8 (par défaut) ou masque manuel
-- **Reconstruction 3D** : COLMAP (feature extraction + matching + bundle adjustment)
+- **Reconstruction 3D** : COLMAP (SIFT boosté : 40960 features/image par défaut)
 - **Training 3DGS** : Brush (open source, cross-platform, AMD/NVIDIA/Intel)
+- **Nettoyage** : commande `clean` qui supprime tous les fichiers intermédiaires (conserve `output/`)
 - **Log JSON** : rapport détaillé de chaque exécution
 - **Cross-platform** : Windows + Linux
+- **Fichiers intermédiaires isolés** : tout est rangé dans `gs_work/`, le dossier principal reste propre
 
 ## Prérequis
 
@@ -83,6 +86,10 @@ python gs_pipeline.py reconstruct
 
 # 4. Training 3DGS (Brush)
 python gs_pipeline.py train --iterations 30000
+
+# 5. Nettoyage (optionnel, après vérification du résultat)
+python gs_pipeline.py clean
+python gs_pipeline.py clean --clean-log
 ```
 
 ### Paramètres
@@ -91,18 +98,25 @@ python gs_pipeline.py train --iterations 30000
 |-----------|--------|-------------|
 | `--input`, `-i` | - | Chemin d'entrée (vidéo, photo, ou dossier) |
 | `--work-dir`, `-w` | `.` | Dossier de travail |
+| `--data-dir` | `gs_work` | Sous-dossier pour les fichiers intermédiaires |
 | `--fps` | 2 | Fréquence d'extraction des frames |
 | `--num-views` | 8 | Nombre de vues perspective par frame 360° |
 | `--fov` | 90 | Champ de vision en degrés |
 | `--width` | 1920 | Largeur de sortie |
 | `--height` | 1080 | Hauteur de sortie |
+| `--format` | auto | Format input : auto, 360, ou perspective |
 | `--mask-path` | - | Chemin vers un masque manuel |
 | `--colmap-path` | - | Chemin vers le binaire COLMAP |
 | `--brush-path` | - | Chemin vers le binaire Brush |
 | `--iterations` | 30000 | Nombre d'itérations de training |
-| `--resolution` | - | Résolution de training (optionnel) |
+| `--resolution` | - | Résolution max des images de training (optionnel) |
+| `--max-features` | 40960 | Max de features SIFT par image (standard COLMAP : 8192) |
+| `--peak-threshold` | 0.0001 | Seuil de pic SIFT, plus bas = plus de features |
+| `--clean-log` | - | Pour `clean` : supprimer aussi le log JSON |
 
 ## Structure des dossiers
+
+Tous les fichiers intermédiaires sont rangés dans `gs_work/` pour ne pas polluer le dossier principal.
 
 ```
 projet/
@@ -114,25 +128,26 @@ projet/
 ├── gs_env/                 # Environnement isolé (créé par setup.py)
 │   ├── bin/                # Binaires (COLMAP, Brush, ffmpeg)
 │   └── venv/               # Environnement virtuel Python
-├── frames/                 # Frames extraites + vues perspective (étape 1)
-│   ├── video_ma_video/
-│   │   ├── frame_00001/
-│   │   │   ├── view_00.jpg
-│   │   │   ├── view_01.jpg
+├── gs_work/                # Fichiers intermédiaires (supprimables via `clean`)
+│   ├── frames/             # Frames extraites + vues perspective (étape 1)
+│   │   ├── video_ma_video/
+│   │   │   ├── frame_00001/
+│   │   │   │   ├── view_00.jpg
+│   │   │   │   ├── view_01.jpg
+│   │   │   │   └── ...
 │   │   │   └── ...
-│   │   └── ...
-│   └── photo1/
-│       ├── view_00.jpg
-│       └── ...
-├── frames_masked/          # Images masquées (étape 2)
-├── masks/                  # Masques (noir = ignoré, blanc = conservé)
-├── colmap/                 # Données COLMAP (étape 3)
-│   ├── images/
-│   ├── sparse/0/
-│   │   ├── cameras.bin
-│   │   ├── images.bin
-│   │   └── points3D.bin
-│   └── database.db
+│   │   └── photo1/
+│   │       ├── view_00.jpg
+│   │       └── ...
+│   ├── frames_masked/      # Images masquées (étape 2)
+│   ├── masks/              # Masques (noir = ignoré, blanc = conservé)
+│   └── colmap/             # Données COLMAP (étape 3)
+│       ├── images/
+│       ├── sparse/0/
+│       │   ├── cameras.bin
+│       │   ├── images.bin
+│       │   └── points3D.bin
+│       └── database.db
 ├── output/                 # Résultat (étape 4)
 │   └── model.ply           # Modèle 3D Gaussian Splatting
 └── pipeline_log.json       # Log de l'exécution
