@@ -376,10 +376,16 @@ def mask_cameraman(args):
             results = model(img, verbose=False)
             binary_mask = np.zeros((h, w), dtype=np.uint8)
             for r in results:
-                for box in r.boxes:
-                    if int(r.names[box.cls[0]]) == 0:  # person class
-                        x1, y1, x2, y2 = map(int, box.xyxy[0])
-                        binary_mask[y1:y2, x1:x2] = 255
+                if r.boxes is None or len(r.boxes) == 0:
+                    continue
+                for i in range(len(r.boxes)):
+                    cls_id = int(r.boxes.cls[i].item())
+                    if cls_id == 0:  # person class
+                        x1, y1, x2, y2 = [int(v) for v in r.boxes.xyxy[i].tolist()]
+                        x1, y1 = max(0, x1), max(0, y1)
+                        x2, y2 = min(w, x2), min(h, y2)
+                        if x2 > x1 and y2 > y1:
+                            binary_mask[y1:y2, x1:x2] = 255
 
         # Appliquer le masque : pixels masqués → noir
         masked_img = img.copy()
